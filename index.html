@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neon Racer: Kart/F1 Handling</title>
+  <style>
+    body { margin: 0; overflow: hidden; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #000; }
+    #hud {
+      position: absolute; top: 20px; left: 20px;
+      color: #00ffcc; font-weight: bold;
+      background: rgba(0, 0, 0, 0.6);
+      padding: 16px 18px;
+      border: 2px solid #00ffcc;
+      border-radius: 10px;
+      box-shadow: 0 0 15px rgba(0, 255, 204, 0.3);
+      pointer-events: none;
+      font-size: 18px;
+      min-width: 220px;
+    }
+    .hud-row { display: flex; justify-content: space-between; margin-bottom: 6px; }
+    .gear-indicator {
+      font-size: 28px;
+      color: yellow;
+      text-align: center;
+      margin-top: 10px;
+      border-top: 1px solid #555;
+      padding-top: 6px;
+      letter-spacing: 2px;
+    }
+
+    #center-msg {
+      position: absolute; top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      color: white; text-align: center; display: none; pointer-events: none;
+      z-index: 10;
+    }
+    h1 { font-size: 56px; margin: 0; text-transform: uppercase; text-shadow: 0 0 20px #ff00de; font-style: italic; }
+    p { font-size: 22px; color: #ddd; margin: 10px 0 0; }
+
+    #controls {
+      position: absolute; bottom: 20px; right: 20px;
+      color: rgba(255,255,255,0.55);
+      text-align: right;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+  </style>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+        "cannon-es": "https://unpkg.com/cannon-es@0.20.0/dist/cannon-es.js"
+      }
+    }
+  </script>
+</head>
+<body>
+
+  <div id="hud">
+    <div class="hud-row"><span>SPEED</span> <span id="speed">0 km/h</span></div>
+    <div class="hud-row"><span>LAP</span> <span id="laps">1 / 3</span></div>
+    <div class="hud-row"><span>TIME</span> <span id="time">0.00</span></div>
+    <div class="gear-indicator" id="gear">N</div>
+  </div>
+
+  <div id="center-msg">
+    <h1 id="msg-title">LAP 1</h1>
+    <p id="msg-sub"></p>
+  </div>
+
+  <div id="controls">
+    WASD to Drive • R to Reset<br />
+    Finish 3 Laps
+  </div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import * as CANNON from "cannon-es";
+
+    // --- CONFIGURATION ---
+    const GAME_CONFIG = {
+      maxLaps: 3,
+      colors: {
+        sky: 0x2a003b,
+        ground: 0x333333,
+        grid: 0x00ffcc,
+        carBody: 0x111111,
+        carCabin: 0xff0055,
+        carWing: 0x00ffff,
+        carGlow: 0x39ff14,
+        wall: 0x666666,
+        palette: [0xff00cc, 0x3333ff, 0x00ffff, 0xff9900, 0xcc00ff, 0xff3333]
+      },
+      physics: {
+        force: 5200,
+        reverseForce: 1800,
+        brake: 260,
+        maxSteer: 0.85,
+        steerSpeed: 0.10,
+        friction: 0.001,
+        restitution: 0.0,
+        grip: 0.985,
+        stability: 0.90,
+        downforce: 55
+      }
+    };
+
+    let scene, camera, renderer, world;
+    const fixedTimeStep = 1 / 60;
+
+    let carBody, carMesh, visualBody;
+    let frontWheels = [], rearWheels = [];
+    let inputs = { w: false, a: false, s: false, d: false };
+
+    let startTime = Date.now();
+    let lapCount = 1;
+    let checkpointPassed = false;
+    let gameFinished = false;
+
+    let currentSteer = 0;
+    let currentGear = "N";
+
+    // HUD elements (cache)
+    const speedEl = document.getElementById("speed");
+    const timeEl  = document.getElementById("time");
+    const gearEl  = document.getElementById("gear");
+    const lapsEl  = document.getElementById("laps");
+
+    // Checkpoint positions (Z axis)
+    const CP1_Z = 45;    // checkpoint
+    const FINISH_Z = -40; // finish
+
+    init();
+    requestAnimationFrame(animate);
+
+    function init() {
+      // Visuals
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(GAME_CONFIG.colors.sky);
+      scene.fog = new THREE.FogExp2(GAME_CONFIG.colors.sky, 0.012);
+
+      camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 500);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      document.body.appendChild(renderer.domElement);
+
+      // Make canvas focusable -> nhận phím ổn định
+      renderer.domElement.tabIndex = 0;
+      renderer.domElement.style.outline = "none";
+      renderer.domElement.focus();
+      renderer.domElement.addEventListener("click", () => renderer.domElement.focus());
+
+      const ambient = new THREE.AmbientLight(0xffffff, 0.9);
+      scene.add(ambient);
+
+      const dirLight = new THREE.DirectionalLight(0xffddee, 1.2);
+      dirLight.position.set(50, 50, 50);
+      dirLight.castShadow = true;
+      dirLight.shadow.mapSize.set(2048, 2048);
+      scene.add(dirLight);
+
+      // Physics
+      world = new CANNON.World();
+      world.gravity.set(0, -9.82, 0);
+      world.allowSleep = true;
+      world.solver.iterations = 10;
+
+      world.broadphase = new CANNON.SAPBroadphase(world);
+
+      const groundMat = new CANNON.Material();
+      const carMat = new CANNON.Material();
+      world.addContactMaterial(new CANNON.ContactMaterial(groundMat, carMat, {
+        friction: GAME_CONFIG.physics.friction,
+        restitution: GAME_CONFIG.physics.restitution
+      }));
+
+      // Objects
+      createTrack(groundMat);
+      createColorfulCity();
+      createCheckpoints();
+      createDetailedCar(carMat);
+
+      // ✅ IMPORTANT: input
+      setupInputs();
+
+      window.addEventListener("resize", onResize);
+      flashMessage("KART/F1 MODE", "Ready!");
+    }
+
+    // --- VISUALS ---
+    function createWheelGroup() {
+      const wheelGroup = new THREE.Group();
+
+      const tireGeo = new THREE.CylinderGeometry(0.50, 0.50, 0.55, 32);
+      tireGeo.rotateZ(Math.PI / 2);
+      const tireMat = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.85 });
+      const tire = new THREE.Mesh(tireGeo, tireMat);
+      tire.castShadow = true;
+      wheelGroup.add(tire);
+
+      const rimGeo = new THREE.CylinderGeometry(0.28, 0.28, 0.57, 16);
+      rimGeo.rotateZ(Math.PI / 2);
+      const rimMat = new THREE.MeshStandardMaterial({
+        color: GAME_CONFIG.colors.carWing,
+        metalness: 0.9,
+        roughness: 0.12,
+        emissive: GAME_CONFIG.colors.carWing,
+        emissiveIntensity: 0.8
+      });
+      const rim = new THREE.Mesh(rimGeo, rimMat);
+      wheelGroup.add(rim);
+
+      return wheelGroup;
+    }
+
+    function createDetailedCar(mat) {
+      const shape = new CANNON.Box(new CANNON.Vec3(1.15, 0.28, 2.55));
+      carBody = new CANNON.Body({ mass: 140, material: mat });
+      carBody.addShape(shape);
+
+      carBody.position.set(0, 3, -40);
+      carBody.linearDamping = 0.35;
+      carBody.angularDamping = 0.75;
+
+      // ✅ khóa roll/pitch, chỉ cho yaw - hết tự ngã
+      carBody.angularFactor.set(0, 1, 0);
+
+      // ✅ hết bật khi xé dâu
+      carBody.sleepSpeedLimit = 0.2;
+      carBody.sleepTimeLimit = 0.5;
+
+      // ✅ chặn lật (anti-jump chắc nhất)
+      carBody.fixedRotation = true;
+      carBody.updateMassProperties();
+
+      world.addBody(carBody);
+
+      carMesh = new THREE.Group();
+      visualBody = new THREE.Group();
+      carMesh.add(visualBody);
+
+      const createMat = (color, intensity = 0.25) =>
+        new THREE.MeshStandardMaterial({
+          color,
+          roughness: 0.38,
+          metalness: 0.65,
+          emissive: color,
+          emissiveIntensity: intensity
+        });
+
+      const bodyMat = createMat(GAME_CONFIG.colors.carBody, 0.15);
+      const cabinMat = createMat(GAME_CONFIG.colors.carCabin, 0.22);
+      const wingMat  = createMat(GAME_CONFIG.colors.carWing, 0.35);
+      const glowMat  = new THREE.MeshBasicMaterial({ color: GAME_CONFIG.colors.carGlow });
+      const windowMat = new THREE.MeshStandardMaterial({ color: 0x000000, metalness: 1, roughness: 0 });
+
+      const chassis = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.35, 5.4), bodyMat);
+      chassis.castShadow = true;
+      visualBody.add(chassis);
+
+      const cabin = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.35, 1.6), cabinMat);
+      cabin.position.set(0, 0.33, -0.9);
+      cabin.castShadow = true;
+      visualBody.add(cabin);
+
+      const windshield = new THREE.Mesh(new THREE.PlaneGeometry(1.1, 0.35), windowMat);
+      windshield.position.set(0, 0.46, -0.25);
+      windshield.rotation.x = -Math.PI / 4;
+      visualBody.add(windshield);
+
+      const nose = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.18, 1.2), wingMat);
+      nose.position.set(0, 0.07, 2.1);
+      nose.castShadow = true;
+      visualBody.add(nose);
+
+      const frontWing = new THREE.Mesh(new THREE.BoxGeometry(2.6, 0.08, 0.6), wingMat);
+      frontWing.position.set(0, 0.05, 2.55);
+      frontWing.castShadow = true;
+      visualBody.add(frontWing);
+
+      const sideGlow = new THREE.Mesh(new THREE.BoxGeometry(2.3, 0.08, 4.6), glowMat);
+      sideGlow.position.set(0, -0.15, 0);
+      visualBody.add(sideGlow);
+
+      const rearWing = new THREE.Mesh(new THREE.BoxGeometry(2.8, 0.12, 0.7), wingMat);
+      rearWing.position.set(0, 0.52, -2.65);
+      rearWing.castShadow = true;
+      visualBody.add(rearWing);
+
+      const positions = [
+        { x: -1.35, z:  1.55, front: true  },
+        { x:  1.35, z:  1.55, front: true  },
+        { x: -1.35, z: -1.75, front: false },
+        { x:  1.35, z: -1.75, front: false }
+      ];
+
+      frontWheels = [];
+      rearWheels = [];
+
+      positions.forEach(pos => {
+        const wGroup = createWheelGroup();
+        wGroup.position.set(pos.x, -0.25, pos.z);
+        carMesh.add(wGroup);
+        if (pos.front) frontWheels.push(wGroup);
+        else rearWheels.push(wGroup);
+      });
+
+      scene.add(carMesh);
+    }
+
+    function createColorfulCity() {
+      const geometry = new THREE.BoxGeometry(1, 1, 1);
+      for (let i = 0; i < 120; i++) {
+        const x = (Math.random() - 0.5) * 450;
+        const z = (Math.random() - 0.5) * 450;
+        if (Math.abs(x) < 70 && Math.abs(z) < 80) continue;
+
+        const h = Math.random() * 40 + 10;
+        const w = Math.random() * 12 + 6;
+
+        const color = GAME_CONFIG.colors.palette[Math.floor(Math.random() * GAME_CONFIG.colors.palette.length)];
+        const material = new THREE.MeshStandardMaterial({ color, roughness: 0.7 });
+
+        const building = new THREE.Mesh(geometry, material);
+        building.position.set(x, h / 2, z);
+        building.scale.set(w, h, w);
+        building.castShadow = true;
+        building.receiveShadow = true;
+        scene.add(building);
+
+        if (Math.random() > 0.5) {
+          const neonMat = new THREE.MeshBasicMaterial({ color });
+          const strip = new THREE.Mesh(geometry, neonMat);
+          strip.position.set(x, h, z);
+          strip.scale.set(w * 0.9, 0.5, w * 0.9);
+          scene.add(strip);
+        }
+      }
+    }
+
+    function createTrack(mat) {
+      const groundBody = new CANNON.Body({ mass: 0, material: mat });
+      groundBody.addShape(new CANNON.Plane());
+      groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+      world.addBody(groundBody);
+
+      const gridHelper = new THREE.GridHelper(500, 150, GAME_CONFIG.colors.grid, 0x444444);
+      gridHelper.position.y = 0.05;
+      gridHelper.material.transparent = true;
+      gridHelper.material.opacity = 0.3;
+      scene.add(gridHelper);
+
+      const plane = new THREE.Mesh(
+        new THREE.PlaneGeometry(500, 500),
+        new THREE.MeshStandardMaterial({ color: GAME_CONFIG.colors.ground, roughness: 0.5 })
+      );
+      plane.rotation.x = -Math.PI / 2;
+      plane.receiveShadow = true;
+      scene.add(plane);
+
+      createWall(0, 55, 130, 2);
+      createWall(0, -55, 130, 2);
+      createWall(-65, 0, 2, 110);
+      createWall(65, 0, 2, 110);
+      createWall(0, 0, 40, 50);
+    }
+
+    function createWall(x, z, w, d) {
+      const h = 4;
+      const body = new CANNON.Body({ mass: 0 });
+      body.addShape(new CANNON.Box(new CANNON.Vec3(w / 2, h / 2, d / 2)));
+      body.position.set(x, h / 2, z);
+      world.addBody(body);
+
+      const mesh = new THREE.Mesh(
+        new THREE.BoxGeometry(w, h, d),
+        new THREE.MeshStandardMaterial({ color: GAME_CONFIG.colors.wall, roughness: 0.1, metalness: 0.1 })
+      );
+      mesh.position.copy(body.position);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      scene.add(mesh);
+    }
+
+    function createCheckpoints() {
+      const makeTrigger = (z, color) => {
+        const body = new CANNON.Body({ isTrigger: true });
+        body.addShape(new CANNON.Box(new CANNON.Vec3(15, 5, 1)));
+        body.position.set(0, 2, z);
+        world.addBody(body);
+
+        const mesh = new THREE.Mesh(
+          new THREE.BoxGeometry(30, 0.2, 2),
+          new THREE.MeshBasicMaterial({ color, opacity: 0.5, transparent: true })
+        );
+        mesh.position.set(0, 0.1, z);
+        scene.add(mesh);
+
+        return body;
+      };
+
+      makeTrigger(45, 0xffff00).addEventListener("collide", (e) => {
+        if (e.body === carBody) checkpointPassed = true;
+      });
+
+      makeTrigger(-40, 0xffffff).addEventListener("collide", (e) => {
+        if (e.body === carBody && checkpointPassed) completeLap();
+      });
+    }
+
+    function completeLap() {
+      checkpointPassed = false;
+      if (lapCount < GAME_CONFIG.maxLaps) {
+        lapCount++;
+        lapsEl.innerText = `${lapCount} / ${GAME_CONFIG.maxLaps}`;
+        flashMessage(`LAP ${lapCount}`);
+      } else {
+        gameFinished = true;
+        flashMessage("VICTORY!", "Final Time: " + timeEl.innerText);
+      }
+    }
+
+    function flashMessage(title, sub = "") {
+      const el = document.getElementById("center-msg");
+      document.getElementById("msg-title").innerText = title;
+      document.getElementById("msg-sub").innerText = sub;
+      el.style.display = "block";
+      el.style.opacity = "1";
+      setTimeout(() => { el.style.display = "none"; }, 2000);
+    }
+
+    function setupInputs() {
+  // gỡ listener cũ nếu reload / live server inject
+  if (window.__NR_KEYS__) {
+    window.removeEventListener("keydown", window.__NR_KEYS__.down);
+    window.removeEventListener("keyup", window.__NR_KEYS__.up);
+  }
+
+  const handle = (e, state) => {
+    switch (e.code) {
+      case "KeyW": inputs.w = state; break;
+      case "KeyS": inputs.s = state; break;
+      case "KeyA": inputs.a = state; break;
+      case "KeyD": inputs.d = state; break;
+      case "KeyR": if (state) resetCar(); break;
+      default: return;
+    }
+    e.preventDefault();
+  };
+
+  const down = (e) => handle(e, true);
+  const up = (e) => handle(e, false);
+
+  window.__NR_KEYS__ = { down, up };
+
+  window.addEventListener("keydown", down, { passive: false });
+  window.addEventListener("keyup", up, { passive: false });
+
+  console.log("✅ Inputs bound");
+}
+window.addEventListener("blur", () => {
+  inputs.w = inputs.a = inputs.s = inputs.d = false;
+});
+
+    
+
+    function resetCar() {
+      carBody.position.set(0, 3, -40);
+      carBody.quaternion.set(0, 0, 0, 1);
+      carBody.velocity.set(0, 0, 0);
+      carBody.angularVelocity.set(0, 0, 0);
+
+      checkpointPassed = false;
+      currentSteer = 0;
+      currentGear = "N";
+
+      if (gameFinished) {
+        gameFinished = false;
+        lapCount = 1;
+        lapsEl.innerText = `1 / ${GAME_CONFIG.maxLaps}`;
+        startTime = Date.now();
+      }
+    }
+
+    let lastTime;
+
+    function animate(t) {
+      requestAnimationFrame(animate);
+
+      if (lastTime === undefined) lastTime = t;
+      const dt = Math.min((t - lastTime) / 1000, 0.05); // clamp dt tránh tab-switch bị nổ
+      lastTime = t;
+
+      // Stable physics step
+      world.step(fixedTimeStep, dt, 5);
+
+      // --- CONTROL / PHYSICS ---
+      if (!gameFinished) {
+        if (inputs.w || inputs.s || inputs.a || inputs.d) carBody.wakeUp();
+
+        const localVelocity = new CANNON.Vec3(0, 0, 0);
+        carBody.vectorToLocalFrame(carBody.velocity, localVelocity);
+        const forwardSpeed = localVelocity.z;
+
+        const speed = carBody.velocity.length();
+        const speedKmh = speed * 3.6;
+
+        let appliedForce = 0;
+
+        if (inputs.w) {
+          appliedForce = GAME_CONFIG.physics.force;
+          currentGear = "D";
+        }
+        if (inputs.s) {
+          if (forwardSpeed > 1.0) {
+            appliedForce = -GAME_CONFIG.physics.brake * 14;
+            currentGear = "D";
+          } else {
+            appliedForce = -GAME_CONFIG.physics.reverseForce;
+            currentGear = "R";
+          }
+        }
+
+        carBody.applyLocalForce(new CANNON.Vec3(0, 0, appliedForce), new CANNON.Vec3(0, 0, 0));
+
+        // Steering
+        let targetS = 0;
+        if (inputs.a) targetS = GAME_CONFIG.physics.maxSteer;
+        if (inputs.d) targetS = -GAME_CONFIG.physics.maxSteer;
+
+        currentSteer = THREE.MathUtils.lerp(currentSteer, targetS, GAME_CONFIG.physics.steerSpeed);
+
+        const steerScale = THREE.MathUtils.clamp(1.0 - speedKmh / 160, 0.35, 1.0);
+        const dir = forwardSpeed >= 0 ? 1 : -1;
+
+        if (speed > 0.4) {
+          carBody.angularVelocity.y = currentSteer * 6.0 * steerScale * dir;
+        } else {
+          carBody.angularVelocity.y *= 0.8;
+        }
+
+        // Grip / traction
+        const rightVec = new CANNON.Vec3(1, 0, 0);
+        carBody.quaternion.vmult(rightVec, rightVec);
+        const sidewaysSpeed = carBody.velocity.dot(rightVec);
+
+        const gripK = THREE.MathUtils.lerp(1200, 2200, THREE.MathUtils.clamp(speed / 25, 0, 1));
+        const gripForce = -sidewaysSpeed * GAME_CONFIG.physics.grip * gripK;
+
+        if (speed > 0.5) {
+          carBody.applyLocalForce(new CANNON.Vec3(gripForce, 0, 0), new CANNON.Vec3(0, 0, 0));
+        }
+
+        // Downforce
+        const down = -GAME_CONFIG.physics.downforce * (speed * speed);
+        carBody.applyForce(new CANNON.Vec3(0, down, 0), carBody.position);
+
+        // Stability
+        if (!inputs.a && !inputs.d) {
+          carBody.angularVelocity.y *= 1 - GAME_CONFIG.physics.stability;
+        }
+
+        carBody.linearDamping = 0.35;
+        carBody.angularDamping = 0.75;
+
+        // --- SAFETY CLAMPS (anti-explosion) ---
+        const MAX_SPEED = 35; // m/s ~ 126 km/h
+        const v = carBody.velocity;
+        const vSpeed = v.length();
+        if (vSpeed > MAX_SPEED) {
+          v.scale(MAX_SPEED / vSpeed, v);
+        }
+
+        // hạn chế xoay (rất hay gây rung/flip)
+        const MAX_ANG_Y = 6;
+        carBody.angularVelocity.y = THREE.MathUtils.clamp(carBody.angularVelocity.y, -MAX_ANG_Y, MAX_ANG_Y);
+
+        // dập rung trục x,z
+        carBody.angularVelocity.x *= 0.5;
+        carBody.angularVelocity.z *= 0.5;
+
+        // HUD
+        speedEl.innerText = `${Math.round(speedKmh)} km/h`;
+        timeEl.innerText = ((Date.now() - startTime) / 1000).toFixed(2);
+        if (speedKmh < 1) currentGear = "N";
+        gearEl.innerText = currentGear;
+        gearEl.style.color = currentGear === "R" ? "red" : "yellow";
+
+        // --- LAP CHECK (simple Z-based) ---
+        // đi qua checkpoint trước
+        if (!checkpointPassed && carBody.position.z > CP1_Z - 1 && carBody.position.z < CP1_Z + 1) {
+          checkpointPassed = true;
+        }
+
+        // đi qua finish sau khi đã qua checkpoint
+        if (checkpointPassed && carBody.position.z > FINISH_Z - 1 && carBody.position.z < FINISH_Z + 1) {
+          completeLap();
+        }
+      }
+
+      // --- SYNC PHYSICS -> GRAPHICS ---
+      carMesh.position.copy(carBody.position);
+      carMesh.quaternion.copy(carBody.quaternion);
+
+      // Visual suspension
+      const targetRoll = -currentSteer * 0.12;
+      visualBody.rotation.z = THREE.MathUtils.lerp(visualBody.rotation.z, targetRoll, 0.12);
+
+      let targetPitch = 0;
+      if (inputs.w) targetPitch = -0.03;
+      if (inputs.s) targetPitch = 0.05;
+      visualBody.rotation.x = THREE.MathUtils.lerp(visualBody.rotation.x, targetPitch, 0.12);
+
+      // Wheels
+      const localV = new CANNON.Vec3();
+      carBody.vectorToLocalFrame(carBody.velocity, localV);
+      const spinSpeed = localV.z * 0.15;
+
+      frontWheels.forEach(w => {
+        w.rotation.x += spinSpeed;
+        w.rotation.y = currentSteer;
+      });
+      rearWheels.forEach(w => {
+        w.rotation.x += spinSpeed;
+      });
+
+      // Camera follow
+      const relOffset = new THREE.Vector3(0, 4.2, -11.5);
+      const camPos = relOffset.applyMatrix4(carMesh.matrixWorld);
+      camera.position.lerp(camPos, 0.10);
+
+      const lookTarget = carMesh.position.clone();
+      lookTarget.y += 1.0;
+      camera.lookAt(lookTarget);
+
+      renderer.render(scene, camera);
+    }
+
+    function onResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+  </script>
+</body>
+</html>
